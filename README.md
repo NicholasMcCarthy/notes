@@ -2,45 +2,26 @@
 
 A tiny Bash CLI note taker.
 
-It keeps the spirit of a one-file notes script, but adds stable IDs, safer deletion, tags, search, edit, config, local sync, optional `age` encryption, migration from an old `~/.notes` file, and a basic GitHub CI setup.
+It keeps the spirit of a one-file notes script, but adds stable IDs, safer deletion, tags, search, edit, config, local sync, and optional `age` encryption.
 
 ## Install from GitHub
 
-After creating the repo, edit `install.sh` and replace:
+Install from the `latest-release` branch:
 
 ```bash
-REPO="${NOTES_CLI_REPO:-YOUR_GITHUB_USERNAME/notes-cli}"
-```
-
-with your real repo, for example:
-
-```bash
-REPO="${NOTES_CLI_REPO:-nickmccarthy/notes-cli}"
-```
-
-Then create a branch called `latest-release`:
-
-```bash
-git checkout -b latest-release
-git push -u origin latest-release
-```
-
-Install with:
-
-```bash
-curl -Ls https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/notes-cli/latest-release/install.sh | bash
+curl -Ls https://raw.githubusercontent.com/NicholasMcCarthy/notes/latest-release/install.sh | bash
 ```
 
 System-wide install:
 
 ```bash
-curl -Ls https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/notes-cli/latest-release/install.sh | sudo bash
+curl -Ls https://raw.githubusercontent.com/NicholasMcCarthy/notes/latest-release/install.sh | sudo bash
 ```
 
-You can also install from `main`:
+Install from `main`:
 
 ```bash
-curl -Ls https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/notes-cli/main/install.sh | NOTES_CLI_REF=main bash
+curl -Ls https://raw.githubusercontent.com/NicholasMcCarthy/notes/main/install.sh | NOTES_CLI_REF=main bash
 ```
 
 ## Configure
@@ -77,16 +58,23 @@ notes config
 ```bash
 notes add -n work -t "idea,cli" "Make the notes CLI easier to use"
 notes add "Quick untitled note"
+notes "quick note"
+notes --name work "note content"
 
 notes
 notes list -l 30
 notes list --content
+notes --recent 20
+
 notes search cli
 notes search -l 5 "github"
+notes --search "some term"
 
 notes show 1
+notes --content 10
 notes edit 1
 notes delete 1
+notes --delete 3
 
 notes stats
 notes path
@@ -162,29 +150,6 @@ Each row is a TSV record:
 
 ```text
 id    timestamp    name    tags    content
-```
-
-## Migrating from the old script
-
-Your old script stored notes in `~/.notes`. To import them:
-
-```bash
-notes migrate ~/.notes
-```
-
-The old file is not modified.
-
-## Legacy shortcuts
-
-These still work:
-
-```bash
-notes "quick note"
-notes --name work "note content"
-notes --recent 20
-notes --search "some term"
-notes --delete 3
-notes --content 10
 ```
 
 ## Development
