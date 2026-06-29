@@ -1,0 +1,5 @@
+# Local note database if you test in-repo
+notes.tsv
+*.tmp
+.DS_Store
+archive/

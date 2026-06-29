@@ -1,0 +1,723 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="notes"
+VERSION="0.3.0"
+
+CONFIG_DIR="${NOTES_CONFIG_DIR:-${XDG_CONFIG_HOME:-"$HOME/.config"}/notes-cli}"
+CONFIG_FILE="${NOTES_CONFIG_FILE:-"$CONFIG_DIR/config"}"
+
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$CONFIG_FILE"
+    fi
+}
+
+load_config
+
+NOTES_DATETIME_FORMAT="${NOTES_DATETIME_FORMAT:-%Y-%m-%d %H:%M:%S}"
+DEFAULT_LIMIT="${NOTES_LIMIT:-${NOTES_DEFAULT_LIMIT:-15}}"
+DATA_DIR="${NOTES_DIR:-${XDG_DATA_HOME:-"$HOME/.local/share"}/notes-cli}"
+NOTES_FILE="${NOTES_FILE:-"$DATA_DIR/notes.tsv"}"
+NOTES_SYNC_DIR="${NOTES_SYNC_DIR:-}"
+NOTES_SYNC_MODE="${NOTES_SYNC_MODE:-none}" # none | plain | age
+NOTES_AGE_RECIPIENT="${NOTES_AGE_RECIPIENT:-}"
+NOTES_AGE_IDENTITY="${NOTES_AGE_IDENTITY:-"$CONFIG_DIR/age-key.txt"}"
+
+# Backwards-compatible alias from older config drafts.
+if [ -n "${NOTES_SYNC_DIRECTORY:-}" ] && [ -z "$NOTES_SYNC_DIR" ]; then
+    NOTES_SYNC_DIR="$NOTES_SYNC_DIRECTORY"
+fi
+
+die() {
+    printf '%s\n' "error: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+notes - a tiny CLI note taker
+
+Usage:
+  notes                         List recent notes
+  notes add [-n NAME] [-t TAGS] NOTE...
+  notes list [-l LIMIT] [--content]
+  notes search [-l LIMIT] QUERY
+  notes show ID_OR_NUMBER
+  notes edit ID_OR_NUMBER
+  notes delete ID_OR_NUMBER
+  notes sync [push|pull|status]
+  notes configure
+  notes config
+  notes stats
+  notes path
+  notes migrate [OLD_NOTES_FILE]
+  notes help
+
+Legacy-compatible shortcuts:
+  notes "quick note text"
+  notes --name NAME "note text"
+  notes --recent [LIMIT]
+  notes --search QUERY
+  notes --delete ID_OR_NUMBER
+  notes --content [LIMIT]
+  notes --configure
+
+Environment:
+  NOTES_FILE=/path/to/notes.tsv         Override notes database path
+  NOTES_CONFIG_FILE=/path/to/config     Override config file path
+  NOTES_LIMIT=20                        Override default list/search limit
+  EDITOR=nano                           Editor used by "notes edit"
+
+Storage:
+  TSV rows: id, timestamp, name, tags, content
+EOF
+}
+
+init_db() {
+    mkdir -p "$(dirname "$NOTES_FILE")"
+    touch "$NOTES_FILE"
+}
+
+sanitize_field() {
+    # Keep the database one-line-per-note by removing tabs/newlines.
+    printf '%s' "${1:-}" | tr '\t\r\n' '   ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
+}
+
+make_id() {
+    local base id attempt
+    base="$(date '+%Y%m%d%H%M%S')"
+    attempt=0
+
+    while :; do
+        id="${base}-${RANDOM}"
+        if ! awk -F '\t' -v id="$id" '$1 == id { found = 1 } END { exit found ? 0 : 1 }' "$NOTES_FILE"; then
+            printf '%s\n' "$id"
+            return 0
+        fi
+
+        attempt=$((attempt + 1))
+        [ "$attempt" -lt 20 ] || die "could not allocate note id"
+    done
+}
+
+is_int() {
+    case "${1:-}" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+resolve_id_or_number() {
+    local key="$1"
+    local resolved
+
+    # Prefer stable IDs.
+    if awk -F '\t' -v id="$key" '$1 == id { found = 1 } END { exit found ? 0 : 1 }' "$NOTES_FILE"; then
+        printf '%s\n' "$key"
+        return 0
+    fi
+
+    # Allow the visible row number from list/search output.
+    if is_int "$key"; then
+        resolved="$(awk -F '\t' -v n="$key" 'NR == n { print $1; exit }' "$NOTES_FILE")"
+        [ -n "$resolved" ] || die "no note at number $key"
+        printf '%s\n' "$resolved"
+        return 0
+    fi
+
+    die "note not found: $key"
+}
+
+render_rows() {
+    local content_only="${1:-0}"
+
+    if [ "$content_only" -eq 0 ]; then
+        printf '%-5s %-20s %-19s %-20s %-16s %s\n' "No." "ID" "Date" "Name" "Tags" "Note"
+        printf '%-5s %-20s %-19s %-20s %-16s %s\n' "---" "--" "----" "----" "----" "----"
+    fi
+
+    awk -F '\t' -v content_only="$content_only" '
+        function trunc(s, n) {
+            return length(s) > n ? substr(s, 1, n - 3) "..." : s
+        }
+
+        {
+            line = $1
+            id = $2
+            ts = $3
+            name = $4
+            tags = $5
+            content = $6
+
+            if (content_only) {
+                printf "%s] %s\n", line, content
+            } else {
+                printf "%-5s %-20s %-19s %-20s %-16s %s\n",
+                    line, id, ts, trunc(name, 20), trunc(tags, 16), content
+            }
+        }
+    '
+}
+
+add_cmd() {
+    local name="Untitled"
+    local tags=""
+    local content=""
+    local timestamp id
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -n|--name)
+                [ "$#" -ge 2 ] || die "--name requires a value"
+                name="$2"
+                shift 2
+                ;;
+            -t|--tags)
+                [ "$#" -ge 2 ] || die "--tags requires a value"
+                tags="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    content="$*"
+
+    # Supports: echo "long note" | notes add -n work
+    if [ -z "$content" ] && [ ! -t 0 ]; then
+        content="$(cat)"
+    fi
+
+    [ -n "$content" ] || die "empty note"
+
+    timestamp="$(date "+$NOTES_DATETIME_FORMAT")"
+    id="$(make_id)"
+    name="$(sanitize_field "$name")"
+    tags="$(sanitize_field "$tags")"
+    content="$(sanitize_field "$content")"
+
+    printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$timestamp" "$name" "$tags" "$content" >> "$NOTES_FILE"
+    printf 'Added %s\n' "$id"
+}
+
+list_cmd() {
+    local limit="$DEFAULT_LIMIT"
+    local content_only=0
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -l|--limit)
+                [ "$#" -ge 2 ] || die "--limit requires a value"
+                limit="$2"
+                shift 2
+                ;;
+            --content)
+                content_only=1
+                shift
+                ;;
+            *)
+                if is_int "$1"; then
+                    limit="$1"
+                    shift
+                else
+                    die "unknown list option: $1"
+                fi
+                ;;
+        esac
+    done
+
+    is_int "$limit" || die "limit must be an integer"
+
+    awk -F '\t' '{ print NR "\t" $0 }' "$NOTES_FILE" | tail -n "$limit" | render_rows "$content_only"
+}
+
+search_cmd() {
+    local limit="$DEFAULT_LIMIT"
+    local query=""
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -l|--limit)
+                [ "$#" -ge 2 ] || die "--limit requires a value"
+                limit="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    query="$*"
+    [ -n "$query" ] || die "search query required"
+    is_int "$limit" || die "limit must be an integer"
+
+    awk -F '\t' -v q="$query" -v limit="$limit" '
+        BEGIN { q = tolower(q) }
+
+        index(tolower($0), q) > 0 {
+            matches[++count] = NR "\t" $0
+        }
+
+        END {
+            start = count - limit + 1
+            if (start < 1) start = 1
+
+            for (i = start; i <= count; i++) {
+                if (i in matches) print matches[i]
+            }
+        }
+    ' "$NOTES_FILE" | render_rows 0
+}
+
+show_cmd() {
+    local id
+    [ "$#" -ge 1 ] || die "show requires an ID or number"
+    id="$(resolve_id_or_number "$1")"
+
+    awk -F '\t' -v id="$id" '
+        $1 == id {
+            printf "ID:      %s\n", $1
+            printf "Date:    %s\n", $2
+            printf "Name:    %s\n", $3
+            printf "Tags:    %s\n", $4
+            printf "Content: %s\n", $5
+            found = 1
+        }
+
+        END { exit found ? 0 : 1 }
+    ' "$NOTES_FILE" || die "note not found: $1"
+}
+
+delete_cmd() {
+    local id tmp
+    [ "$#" -ge 1 ] || die "delete requires an ID or number"
+    id="$(resolve_id_or_number "$1")"
+
+    tmp="$(mktemp)"
+    awk -F '\t' -v id="$id" '$1 != id' "$NOTES_FILE" > "$tmp"
+    mv "$tmp" "$NOTES_FILE"
+
+    printf 'Deleted %s\n' "$id"
+}
+
+edit_cmd() {
+    local id tmp current updated db_tmp
+    [ "$#" -ge 1 ] || die "edit requires an ID or number"
+    id="$(resolve_id_or_number "$1")"
+
+    current="$(awk -F '\t' -v id="$id" '$1 == id { print $5; exit }' "$NOTES_FILE")"
+    tmp="$(mktemp)"
+    printf '%s\n' "$current" > "$tmp"
+
+    "${EDITOR:-vi}" "$tmp"
+
+    updated="$(sanitize_field "$(cat "$tmp")")"
+    rm -f "$tmp"
+
+    [ -n "$updated" ] || die "edited note would be empty"
+
+    db_tmp="$(mktemp)"
+    awk -F '\t' -v OFS='\t' -v id="$id" -v updated="$updated" '
+        $1 == id { $5 = updated }
+        { print }
+    ' "$NOTES_FILE" > "$db_tmp"
+
+    mv "$db_tmp" "$NOTES_FILE"
+    printf 'Updated %s\n' "$id"
+}
+
+stats_cmd() {
+    local count
+    count="$(wc -l < "$NOTES_FILE" | tr -d ' ')"
+    printf 'Notes:       %s\n' "$count"
+    printf 'Notes file:  %s\n' "$NOTES_FILE"
+    printf 'Config file: %s\n' "$CONFIG_FILE"
+    printf 'Sync mode:   %s\n' "$NOTES_SYNC_MODE"
+    printf 'Sync dir:    %s\n' "${NOTES_SYNC_DIR:-not configured}"
+}
+
+config_cmd() {
+    printf 'Config file:      %s\n' "$CONFIG_FILE"
+    printf 'Notes file:       %s\n' "$NOTES_FILE"
+    printf 'Date/time format: %s\n' "$NOTES_DATETIME_FORMAT"
+    printf 'Default limit:    %s\n' "$DEFAULT_LIMIT"
+    printf 'Sync directory:   %s\n' "${NOTES_SYNC_DIR:-not configured}"
+    printf 'Sync mode:        %s\n' "$NOTES_SYNC_MODE"
+    printf 'Age recipient:    %s\n' "${NOTES_AGE_RECIPIENT:-not configured}"
+    printf 'Age identity:     %s\n' "${NOTES_AGE_IDENTITY:-not configured}"
+}
+
+write_config() {
+    local datetime_format="$1"
+    local default_limit="$2"
+    local notes_file="$3"
+    local sync_dir="$4"
+    local sync_mode="$5"
+    local age_recipient="$6"
+    local age_identity="$7"
+    local tmp
+
+    mkdir -p "$CONFIG_DIR"
+    tmp="$(mktemp)"
+
+    {
+        printf '# notes-cli config\n'
+        printf '# Generated by: notes configure\n\n'
+        printf 'NOTES_DATETIME_FORMAT=%q\n' "$datetime_format"
+        printf 'NOTES_DEFAULT_LIMIT=%q\n' "$default_limit"
+        printf 'NOTES_FILE=%q\n' "$notes_file"
+        printf 'NOTES_SYNC_DIR=%q\n' "$sync_dir"
+        printf 'NOTES_SYNC_MODE=%q\n' "$sync_mode"
+        printf 'NOTES_AGE_RECIPIENT=%q\n' "$age_recipient"
+        printf 'NOTES_AGE_IDENTITY=%q\n' "$age_identity"
+    } > "$tmp"
+
+    mv "$tmp" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+}
+
+ask_with_default() {
+    local prompt="$1"
+    local default="$2"
+    local reply
+
+    printf '%s [%s]: ' "$prompt" "$default" >&2
+    IFS= read -r reply || true
+    printf '%s\n' "${reply:-$default}"
+}
+
+ask_sync_mode() {
+    local current="$1"
+    local reply
+
+    cat >&2 <<EOF
+
+Sync mode:
+  1) none  - no sync command
+  2) plain - copy notes.tsv to sync directory
+  3) age   - encrypt notes.tsv to notes.tsv.age in sync directory
+EOF
+
+    case "$current" in
+        none) current="1" ;;
+        plain) current="2" ;;
+        age) current="3" ;;
+    esac
+
+    printf 'Choose sync mode [%s]: ' "$current" >&2
+    IFS= read -r reply || true
+    reply="${reply:-$current}"
+
+    case "$reply" in
+        1|none) printf 'none\n' ;;
+        2|plain) printf 'plain\n' ;;
+        3|age) printf 'age\n' ;;
+        *) die "invalid sync mode: $reply" ;;
+    esac
+}
+
+maybe_generate_age_key() {
+    local identity="$1"
+    local recipient="$2"
+    local reply generated
+
+    if [ -n "$recipient" ]; then
+        printf '%s\n' "$recipient"
+        return 0
+    fi
+
+    if [ -f "$identity" ]; then
+        generated="$(awk '/^# public key:/ { print $4; exit }' "$identity")"
+        if [ -n "$generated" ]; then
+            printf '%s\n' "$generated"
+            return 0
+        fi
+    fi
+
+    if ! command -v age-keygen >/dev/null 2>&1; then
+        printf '\nInstall age first, then run notes configure again to generate a key.\n' >&2
+        printf '%s\n' "$recipient"
+        return 0
+    fi
+
+    printf 'Generate a new age key at %s? [Y/n]: ' "$identity" >&2
+    IFS= read -r reply || true
+    reply="${reply:-Y}"
+
+    case "$reply" in
+        y|Y|yes|YES)
+            mkdir -p "$(dirname "$identity")"
+            age-keygen -o "$identity" >/dev/null
+            chmod 600 "$identity"
+            generated="$(awk '/^# public key:/ { print $4; exit }' "$identity")"
+            [ -n "$generated" ] || die "could not read generated age public key"
+            printf '%s\n' "$generated"
+            ;;
+        *)
+            printf '%s\n' "$recipient"
+            ;;
+    esac
+}
+
+configure_cmd() {
+    local datetime_format default_limit notes_file sync_dir sync_mode age_recipient age_identity
+
+    cat >&2 <<EOF
+notes configuration
+
+Press Enter to keep the current/default value.
+EOF
+
+    datetime_format="$(ask_with_default 'Date/time format for new notes' "$NOTES_DATETIME_FORMAT")"
+    default_limit="$(ask_with_default 'Default list/search limit' "$DEFAULT_LIMIT")"
+    is_int "$default_limit" || die "default limit must be an integer"
+
+    notes_file="$(ask_with_default 'Notes database file' "$NOTES_FILE")"
+    sync_dir="$(ask_with_default 'Sync directory, e.g. local Google Drive/OneDrive folder' "${NOTES_SYNC_DIR:-$HOME/NotesSync}")"
+    sync_mode="$(ask_sync_mode "$NOTES_SYNC_MODE")"
+
+    age_identity="$NOTES_AGE_IDENTITY"
+    age_recipient="$NOTES_AGE_RECIPIENT"
+
+    if [ "$sync_mode" = "age" ]; then
+        age_identity="$(ask_with_default 'age identity file for decrypting pulls' "$age_identity")"
+        age_recipient="$(ask_with_default 'age public recipient for encrypting pushes' "$age_recipient")"
+        age_recipient="$(maybe_generate_age_key "$age_identity" "$age_recipient")"
+
+        if [ -z "$age_recipient" ]; then
+            printf '\nWarning: age sync selected without a recipient. notes sync push will fail until configured.\n' >&2
+        fi
+    fi
+
+    write_config "$datetime_format" "$default_limit" "$notes_file" "$sync_dir" "$sync_mode" "$age_recipient" "$age_identity"
+
+    printf '\nSaved config to %s\n' "$CONFIG_FILE"
+    printf 'Run: notes config\n'
+}
+
+require_sync_dir() {
+    [ -n "$NOTES_SYNC_DIR" ] || die "sync directory not configured; run notes configure"
+    mkdir -p "$NOTES_SYNC_DIR"
+}
+
+sync_status_cmd() {
+    config_cmd
+    printf '\nSync files:\n'
+
+    if [ -n "$NOTES_SYNC_DIR" ] && [ -d "$NOTES_SYNC_DIR" ]; then
+        find "$NOTES_SYNC_DIR" -maxdepth 1 \( -name 'notes.tsv' -o -name 'notes.tsv.age' \) -print | sort || true
+    else
+        printf 'not configured\n'
+    fi
+}
+
+sync_push_plain() {
+    require_sync_dir
+    cp "$NOTES_FILE" "$NOTES_SYNC_DIR/notes.tsv"
+    printf 'Copied plaintext notes to %s\n' "$NOTES_SYNC_DIR/notes.tsv"
+}
+
+sync_pull_plain() {
+    local source backup
+    require_sync_dir
+    source="$NOTES_SYNC_DIR/notes.tsv"
+    [ -f "$source" ] || die "sync file not found: $source"
+
+    backup="$NOTES_FILE.bak.$(date '+%Y%m%d%H%M%S')"
+    cp "$NOTES_FILE" "$backup"
+    cp "$source" "$NOTES_FILE"
+
+    printf 'Pulled plaintext notes from %s\n' "$source"
+    printf 'Backup created at %s\n' "$backup"
+}
+
+sync_push_age() {
+    local tmp target
+    require_sync_dir
+    command -v age >/dev/null 2>&1 || die "age is not installed"
+    [ -n "$NOTES_AGE_RECIPIENT" ] || die "age recipient not configured; run notes configure"
+
+    target="$NOTES_SYNC_DIR/notes.tsv.age"
+    tmp="$(mktemp)"
+    age -r "$NOTES_AGE_RECIPIENT" -o "$tmp" "$NOTES_FILE"
+    mv "$tmp" "$target"
+
+    printf 'Encrypted notes to %s\n' "$target"
+}
+
+sync_pull_age() {
+    local source tmp backup
+    require_sync_dir
+    command -v age >/dev/null 2>&1 || die "age is not installed"
+    [ -f "$NOTES_AGE_IDENTITY" ] || die "age identity not found: $NOTES_AGE_IDENTITY"
+
+    source="$NOTES_SYNC_DIR/notes.tsv.age"
+    [ -f "$source" ] || die "encrypted sync file not found: $source"
+
+    tmp="$(mktemp)"
+    age -d -i "$NOTES_AGE_IDENTITY" -o "$tmp" "$source"
+
+    backup="$NOTES_FILE.bak.$(date '+%Y%m%d%H%M%S')"
+    cp "$NOTES_FILE" "$backup"
+    mv "$tmp" "$NOTES_FILE"
+
+    printf 'Decrypted notes from %s\n' "$source"
+    printf 'Backup created at %s\n' "$backup"
+}
+
+sync_cmd() {
+    local action="${1:-push}"
+
+    case "$action" in
+        status)
+            sync_status_cmd
+            ;;
+        push)
+            case "$NOTES_SYNC_MODE" in
+                none) die "sync mode is none; run notes configure" ;;
+                plain) sync_push_plain ;;
+                age) sync_push_age ;;
+                *) die "unknown sync mode: $NOTES_SYNC_MODE" ;;
+            esac
+            ;;
+        pull)
+            case "$NOTES_SYNC_MODE" in
+                none) die "sync mode is none; run notes configure" ;;
+                plain) sync_pull_plain ;;
+                age) sync_pull_age ;;
+                *) die "unknown sync mode: $NOTES_SYNC_MODE" ;;
+            esac
+            ;;
+        *)
+            die "unknown sync action: $action"
+            ;;
+    esac
+}
+
+migrate_cmd() {
+    local old_file prefix
+    old_file="${1:-"$HOME/.notes"}"
+    [ -f "$old_file" ] || die "old notes file not found: $old_file"
+
+    prefix="legacy-$(date '+%Y%m%d%H%M%S')"
+
+    awk -F ' - ' -v OFS='\t' -v prefix="$prefix" '
+        NF >= 3 {
+            ts = $1
+            name = $2
+            content = $3
+
+            for (i = 4; i <= NF; i++) {
+                content = content " - " $i
+            }
+
+            gsub(/\t|\r|\n/, " ", ts)
+            gsub(/\t|\r|\n/, " ", name)
+            gsub(/\t|\r|\n/, " ", content)
+
+            print prefix "-" NR, ts, name, "", content
+        }
+    ' "$old_file" >> "$NOTES_FILE"
+
+    printf 'Migrated notes from %s into %s\n' "$old_file" "$NOTES_FILE"
+}
+
+main() {
+    init_db
+
+    if [ "$#" -eq 0 ]; then
+        list_cmd
+        exit 0
+    fi
+
+    case "$1" in
+        add|a)
+            shift
+            add_cmd "$@"
+            ;;
+        list|ls|recent|--recent)
+            shift
+            list_cmd "$@"
+            ;;
+        search|s)
+            shift
+            search_cmd "$@"
+            ;;
+        --search)
+            shift
+            search_cmd "$@"
+            ;;
+        show|cat)
+            shift
+            show_cmd "$@"
+            ;;
+        edit|e)
+            shift
+            edit_cmd "$@"
+            ;;
+        delete|del|rm|--delete)
+            shift
+            delete_cmd "$@"
+            ;;
+        content|--content)
+            shift
+            list_cmd --content "$@"
+            ;;
+        sync)
+            shift
+            sync_cmd "$@"
+            ;;
+        configure|--configure)
+            shift
+            configure_cmd "$@"
+            ;;
+        config)
+            shift
+            config_cmd "$@"
+            ;;
+        stats)
+            shift
+            stats_cmd "$@"
+            ;;
+        path)
+            shift
+            printf '%s\n' "$NOTES_FILE"
+            ;;
+        migrate)
+            shift
+            migrate_cmd "$@"
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        version|--version)
+            printf '%s %s\n' "$APP_NAME" "$VERSION"
+            ;;
+        --name|-n)
+            # Legacy compatibility: notes --name work "some note"
+            [ "$#" -ge 3 ] || die "--name requires NAME and note text"
+            legacy_name="$2"
+            shift 2
+            add_cmd --name "$legacy_name" "$@"
+            ;;
+        *)
+            # Legacy compatibility: notes "some quick note"
+            add_cmd "$@"
+            ;;
+    esac
+}
+
+main "$@"
